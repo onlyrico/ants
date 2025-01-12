@@ -23,7 +23,7 @@
 package ants
 
 import (
-	"runtime"
+	"runtime/debug"
 	"time"
 )
 
@@ -31,14 +31,16 @@ import (
 // it starts a goroutine that accepts tasks and
 // performs function calls.
 type goWorkerWithFunc struct {
+	worker
+
 	// pool who owns this worker.
 	pool *PoolWithFunc
 
-	// args is a job should be done.
-	args chan interface{}
+	// arg is the argument for the function.
+	arg chan any
 
-	// recycleTime will be updated when putting a worker back into queue.
-	recycleTime time.Time
+	// lastUsed will be updated when putting a worker back into queue.
+	lastUsed time.Time
 }
 
 // run starts a goroutine to repeat the process
@@ -47,30 +49,47 @@ func (w *goWorkerWithFunc) run() {
 	w.pool.addRunning(1)
 	go func() {
 		defer func() {
-			w.pool.addRunning(-1)
+			if w.pool.addRunning(-1) == 0 && w.pool.IsClosed() {
+				w.pool.once.Do(func() {
+					close(w.pool.allDone)
+				})
+			}
 			w.pool.workerCache.Put(w)
 			if p := recover(); p != nil {
 				if ph := w.pool.options.PanicHandler; ph != nil {
 					ph(p)
 				} else {
-					w.pool.options.Logger.Printf("worker with func exits from a panic: %v\n", p)
-					var buf [4096]byte
-					n := runtime.Stack(buf[:], false)
-					w.pool.options.Logger.Printf("worker with func exits from panic: %s\n", string(buf[:n]))
+					w.pool.options.Logger.Printf("worker exits from panic: %v\n%s\n", p, debug.Stack())
 				}
 			}
 			// Call Signal() here in case there are goroutines waiting for available workers.
 			w.pool.cond.Signal()
 		}()
 
-		for args := range w.args {
-			if args == nil {
+		for arg := range w.arg {
+			if arg == nil {
 				return
 			}
-			w.pool.poolFunc(args)
+			w.pool.fn(arg)
 			if ok := w.pool.revertWorker(w); !ok {
 				return
 			}
 		}
 	}()
+}
+
+func (w *goWorkerWithFunc) finish() {
+	w.arg <- nil
+}
+
+func (w *goWorkerWithFunc) lastUsedTime() time.Time {
+	return w.lastUsed
+}
+
+func (w *goWorkerWithFunc) setLastUsedTime(t time.Time) {
+	w.lastUsed = t
+}
+
+func (w *goWorkerWithFunc) inputArg(arg any) {
+	w.arg <- arg
 }

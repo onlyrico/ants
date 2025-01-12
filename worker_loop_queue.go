@@ -1,10 +1,32 @@
+/*
+ * Copyright (c) 2019. Ants Authors. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 package ants
 
 import "time"
 
 type loopQueue struct {
-	items  []*goWorker
-	expiry []*goWorker
+	items  []worker
+	expiry []worker
 	head   int
 	tail   int
 	size   int
@@ -12,22 +34,22 @@ type loopQueue struct {
 }
 
 func newWorkerLoopQueue(size int) *loopQueue {
+	if size <= 0 {
+		return nil
+	}
 	return &loopQueue{
-		items: make([]*goWorker, size),
+		items: make([]worker, size),
 		size:  size,
 	}
 }
 
 func (wq *loopQueue) len() int {
-	if wq.size == 0 {
+	if wq.size == 0 || wq.isEmpty() {
 		return 0
 	}
 
-	if wq.head == wq.tail {
-		if wq.isFull {
-			return wq.size
-		}
-		return 0
+	if wq.head == wq.tail && wq.isFull {
+		return wq.size
 	}
 
 	if wq.tail > wq.head {
@@ -41,20 +63,13 @@ func (wq *loopQueue) isEmpty() bool {
 	return wq.head == wq.tail && !wq.isFull
 }
 
-func (wq *loopQueue) insert(worker *goWorker) error {
-	if wq.size == 0 {
-		return errQueueIsReleased
-	}
-
+func (wq *loopQueue) insert(w worker) error {
 	if wq.isFull {
 		return errQueueIsFull
 	}
-	wq.items[wq.tail] = worker
-	wq.tail++
+	wq.items[wq.tail] = w
+	wq.tail = (wq.tail + 1) % wq.size
 
-	if wq.tail == wq.size {
-		wq.tail = 0
-	}
 	if wq.tail == wq.head {
 		wq.isFull = true
 	}
@@ -62,23 +77,21 @@ func (wq *loopQueue) insert(worker *goWorker) error {
 	return nil
 }
 
-func (wq *loopQueue) detach() *goWorker {
+func (wq *loopQueue) detach() worker {
 	if wq.isEmpty() {
 		return nil
 	}
 
 	w := wq.items[wq.head]
 	wq.items[wq.head] = nil
-	wq.head++
-	if wq.head == wq.size {
-		wq.head = 0
-	}
+	wq.head = (wq.head + 1) % wq.size
+
 	wq.isFull = false
 
 	return w
 }
 
-func (wq *loopQueue) retrieveExpiry(duration time.Duration) []*goWorker {
+func (wq *loopQueue) refresh(duration time.Duration) []worker {
 	expiryTime := time.Now().Add(-duration)
 	index := wq.binarySearch(expiryTime)
 	if index == -1 {
@@ -115,7 +128,7 @@ func (wq *loopQueue) binarySearch(expiryTime time.Time) int {
 	nlen = len(wq.items)
 
 	// if no need to remove work, return -1
-	if wq.isEmpty() || expiryTime.Before(wq.items[wq.head].recycleTime) {
+	if wq.isEmpty() || expiryTime.Before(wq.items[wq.head].lastUsedTime()) {
 		return -1
 	}
 
@@ -134,10 +147,10 @@ func (wq *loopQueue) binarySearch(expiryTime time.Time) int {
 	basel = wq.head
 	l := 0
 	for l <= r {
-		mid = l + ((r - l) >> 1)
+		mid = l + ((r - l) >> 1) // avoid overflow when computing mid
 		// calculate true mid position from mapped mid position
 		tmid = (mid + basel + nlen) % nlen
-		if expiryTime.Before(wq.items[tmid].recycleTime) {
+		if expiryTime.Before(wq.items[tmid].lastUsedTime()) {
 			r = mid - 1
 		} else {
 			l = mid + 1
@@ -152,10 +165,10 @@ func (wq *loopQueue) reset() {
 		return
 	}
 
-Releasing:
+retry:
 	if w := wq.detach(); w != nil {
-		w.task <- nil
-		goto Releasing
+		w.finish()
+		goto retry
 	}
 	wq.items = wq.items[:0]
 	wq.size = 0
